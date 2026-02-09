@@ -161,20 +161,26 @@ export class SyncEngine {
                         continue;
                     }
                     try {
-                        await this.updateUserBookStatus(existing.userBookId, entry.user_rating);
-                        bookIdToUserBook.set(bookId, { userBookId: existing.userBookId, statusId: this.statusId });
-                        this.results.newBooks++;
-                        this.results.added.push({ title: entry.title, id: bookId });
-                        this.log(`✅ Updated: ${entry.title}`, 'success');
-                        if (this.statusId === 3) {
-                            const rawDate = entry.user_read_at || entry.user_date_added;
-                            if (rawDate) {
-                                const dateStr = this.parseReadDate(rawDate);
-                                if (dateStr) {
-                                    this.log(`Adding Read Date: ${dateStr}`, 'info');
-                                    await this.addReadDate(existing.userBookId, dateStr);
+                        await this.deleteUserBook(existing.userBookId);
+                        const userBookId = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
+                        if (userBookId) {
+                            bookIdToUserBook.set(bookId, { userBookId, statusId: this.statusId });
+                            this.results.newBooks++;
+                            this.results.added.push({ title: entry.title, id: bookId });
+                            this.log(`✅ Updated: ${entry.title}`, 'success');
+                            if (this.statusId === 3) {
+                                const rawDate = entry.user_read_at || entry.user_date_added;
+                                if (rawDate) {
+                                    const dateStr = this.parseReadDate(rawDate);
+                                    if (dateStr) {
+                                        this.log(`Adding Read Date: ${dateStr}`, 'info');
+                                        await this.addReadDate(userBookId, dateStr);
+                                    }
                                 }
                             }
+                        } else {
+                            this.log(`❌ Failed to re-add: ${entry.title}`, 'error');
+                            this.results.errors.push(entry.title);
                         }
                     } catch (e) {
                         this.log(`❌ Error updating '${entry.title}': ${e.message}`, 'error');
@@ -351,9 +357,9 @@ export class SyncEngine {
         return (n >= 1 && n <= 5) ? n : null;
     }
 
-    async updateUserBookStatus(userBookId, rating) {
-        const mutation = `mutation UpdateUserBook($id: Int!, $status_id: Int!, $rating: numeric) { update_user_books(where: {id: {_eq: $id}}, _set: {status_id: $status_id, rating: $rating}) { affected_rows } }`;
-        await this.graphqlQuery(mutation, { id: userBookId, status_id: this.statusId, rating: this.normalizeRating(rating) });
+    async deleteUserBook(userBookId) {
+        const mutation = `mutation DeleteUserBook($id: Int!) { delete_user_books(where: {id: {_eq: $id}}) { affected_rows } }`;
+        await this.graphqlQuery(mutation, { id: userBookId });
     }
 
     async addBookToHardcover(bookId, rating, readAt) {
