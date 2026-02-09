@@ -358,7 +358,7 @@ export class SyncEngine {
     }
 
     async deleteUserBook(userBookId) {
-        const mutation = `mutation DeleteUserBook($id: Int!) { delete_user_books(where: {id: {_eq: $id}}) { affected_rows } }`;
+        const mutation = `mutation DeleteUserBook($id: Int!) { delete_user_book(id: $id) { id } }`;
         await this.graphqlQuery(mutation, { id: userBookId });
     }
 
