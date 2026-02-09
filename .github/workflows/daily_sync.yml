@@ -33,6 +33,7 @@ jobs:
     - name: Run Sync Script
       env:
         GOODREADS_RSS_URL: ${{ secrets.GOODREADS_RSS_URL }}
+        GOODREADS_CURRENTLY_READING_RSS_URL: ${{ secrets.GOODREADS_CURRENTLY_READING_RSS_URL }}
         HARDCOVER_API_TOKEN: ${{ secrets.HARDCOVER_API_TOKEN }}
       run: |
         LIMIT="${{ inputs.limit }}"

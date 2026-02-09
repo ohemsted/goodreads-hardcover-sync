@@ -78,11 +78,12 @@ export const Utils = {
 };
 
 export class SyncEngine {
-    constructor({ hcToken, rssUrl, isDryRun = false, limit = 20, onLog = () => {} }) {
+    constructor({ hcToken, rssUrl, isDryRun = false, limit = 20, statusId = 3, onLog = () => {} }) {
         this.hcToken = hcToken;
         this.rssUrl = rssUrl;
         this.isDryRun = isDryRun;
         this.limit = limit;
+        this.statusId = statusId;
         this.onLog = onLog;
         this.hcEndpoint = "https://api.hardcover.app/v1/graphql";
         this.results = {
@@ -295,7 +296,8 @@ export class SyncEngine {
     }
 
     async getHardcoverLibraryIds() {
-        const query = `query GetMyBooks { me { user_books(where: {status_id: {_eq: 3}}) { book { id title editions { isbn_10 isbn_13 } } } } }`;
+        // Check for books with both status_id 2 (currently-reading) and 3 (read) to prevent duplicates
+        const query = `query GetMyBooks { me { user_books(where: {status_id: {_in: [2, 3]}}) { book { id title editions { isbn_10 isbn_13 } } } } }`;
         const res = await this.graphqlQuery(query);
         const bookIds = new Set();
         const existingIsbns = new Set();
@@ -350,8 +352,8 @@ export class SyncEngine {
     }
 
     async addBookToHardcover(bookId, rating, readAt) {
-        const mutation = `mutation AddUserBook($book_id: Int!, $rating: numeric) { insert_user_book(object: { book_id: $book_id, status_id: 3, rating: $rating }) { id error } }`;
-        const res = await this.graphqlQuery(mutation, { book_id: bookId, rating: rating ? parseInt(rating) : null });
+        const mutation = `mutation AddUserBook($book_id: Int!, $status_id: Int!, $rating: numeric) { insert_user_book(object: { book_id: $book_id, status_id: $status_id, rating: $rating }) { id error } }`;
+        const res = await this.graphqlQuery(mutation, { book_id: bookId, status_id: this.statusId, rating: rating ? parseInt(rating) : null });
         
         const data = res.data.insert_user_book;
         if (data && data.error) {
