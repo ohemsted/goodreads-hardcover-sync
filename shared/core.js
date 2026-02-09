@@ -352,7 +352,7 @@ export class SyncEngine {
     }
 
     async updateUserBookStatus(userBookId, rating) {
-        const mutation = `mutation UpdateUserBook($id: Int!, $status_id: Int!, $rating: numeric) { update_user_books_by_pk(pk_columns: {id: $id}, _set: {status_id: $status_id, rating: $rating}) { id } }`;
+        const mutation = `mutation UpdateUserBook($id: Int!, $status_id: Int!, $rating: numeric) { update_user_books(where: {id: {_eq: $id}}, _set: {status_id: $status_id, rating: $rating}) { affected_rows } }`;
         await this.graphqlQuery(mutation, { id: userBookId, status_id: this.statusId, rating: this.normalizeRating(rating) });
     }
 
