@@ -78,11 +78,12 @@ export const Utils = {
 };
 
 export class SyncEngine {
-    constructor({ hcToken, rssUrl, isDryRun = false, limit = 20, onLog = () => {} }) {
+    constructor({ hcToken, rssUrl, isDryRun = false, limit = 20, statusId = 3, onLog = () => {} }) {
         this.hcToken = hcToken;
         this.rssUrl = rssUrl;
         this.isDryRun = isDryRun;
         this.limit = limit;
+        this.statusId = statusId;
         this.onLog = onLog;
         this.hcEndpoint = "https://api.hardcover.app/v1/graphql";
         this.results = {
@@ -119,7 +120,7 @@ export class SyncEngine {
 
             // 2. Fetch Library
             this.log("Fetching Hardcover Library...", "info");
-            const { bookIds, existingIsbns, existingTitles } = await this.getHardcoverLibraryIds();
+            const { bookIds, bookIdToUserBook, existingIsbns, existingTitles } = await this.getHardcoverLibraryIds();
             this.log(`Library loaded. ${bookIds.size} books.`, "info");
 
             // 3. Compare
@@ -130,28 +131,7 @@ export class SyncEngine {
             this.log(`Processing ${processList.length} recent books... (Limit: ${this.limit === 0 ? 'ALL' : limitVal})`, "info");
 
             for (const entry of processList) {
-                // --- A. Cache Check ---
-                if (entry.isbn13 && existingIsbns.has(entry.isbn13)) {
-                    this.log(`[Skip] '${entry.title}' (ISBN Cache Hit)`, 'debug');
-                    continue;
-                }
-                if (existingTitles.has(entry.title.trim().toLowerCase())) {
-                    this.log(`[Skip] '${entry.title}' (Title Cache Hit)`, 'debug');
-                    continue;
-                }
-
-                // Fuzzy Check
-                let isFuzzyMatch = false;
-                for (const existingTitle of existingTitles) {
-                    if (Utils.tokenSortRatio(entry.title, existingTitle) > 90) {
-                        this.log(`[Skip] '${entry.title}' (Fuzzy Cache Hit: '${existingTitle}')`, 'debug');
-                        isFuzzyMatch = true;
-                        break;
-                    }
-                }
-                if (isFuzzyMatch) continue;
-
-                // --- B. API Verification ---
+                // --- A. API Verification ---
                 this.log(`[Candidate] '${entry.title}' - Verifying...`, 'info');
                 
                 let bookId = null;
@@ -167,15 +147,52 @@ export class SyncEngine {
                     continue;
                 }
 
-                // --- C. ID Check ---
-                if (bookIds.has(bookId)) {
-                    this.log(`[False Positive] Resolved to ID ${bookId}, already in library.`, 'debug');
+                // --- C. Existing Book? Update instead of insert ---
+                const existing = bookIdToUserBook.get(bookId);
+                if (existing) {
+                    if (existing.statusId === this.statusId) {
+                        this.log(`[Skip] '${entry.title}' (already status ${this.statusId})`, 'debug');
+                        continue;
+                    }
+                    this.log(`[Update] '${entry.title}' (ID: ${bookId}) - status ${existing.statusId} -> ${this.statusId}`, 'info');
+                    if (this.isDryRun) {
+                        this.results.newBooks++;
+                        this.results.added.push({ title: entry.title, id: bookId });
+                        continue;
+                    }
+                    try {
+                        await this.deleteUserBook(existing.userBookId);
+                        const userBookId = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
+                        if (userBookId) {
+                            bookIdToUserBook.set(bookId, { userBookId, statusId: this.statusId });
+                            this.results.newBooks++;
+                            this.results.added.push({ title: entry.title, id: bookId });
+                            this.log(`✅ Updated: ${entry.title}`, 'success');
+                            if (this.statusId === 3) {
+                                const rawDate = entry.user_read_at || entry.user_date_added;
+                                if (rawDate) {
+                                    const dateStr = this.parseReadDate(rawDate);
+                                    if (dateStr) {
+                                        this.log(`Adding Read Date: ${dateStr}`, 'info');
+                                        await this.addReadDate(userBookId, dateStr);
+                                    }
+                                }
+                            }
+                        } else {
+                            this.log(`❌ Failed to re-add: ${entry.title}`, 'error');
+                            this.results.errors.push(entry.title);
+                        }
+                    } catch (e) {
+                        this.log(`❌ Error updating '${entry.title}': ${e.message}`, 'error');
+                        this.results.errors.push(`${entry.title} (${e.message})`);
+                    }
+                    await new Promise(r => setTimeout(r, 2000));
                     continue;
                 }
 
-                // --- D. Action ---
+                // --- D. New Book: Insert ---
                 this.log(`[Verified New] '${entry.title}' (ID: ${bookId})`, 'success');
-                
+
                 if (this.isDryRun) {
                     this.results.newBooks++;
                     this.results.added.push({ title: entry.title, id: bookId });
@@ -191,45 +208,15 @@ export class SyncEngine {
                         this.results.added.push({ title: entry.title, id: bookId });
                         this.log(`✅ Added: ${entry.title}`, 'success');
 
-                        // Handle Date
-                        // Logic: Prefer 'user_read_at'. Fallback to 'user_date_added' if missing.
                         const rawDate = entry.user_read_at || entry.user_date_added;
-                        
                         if (rawDate) {
                             this.log(`Received Date: '${rawDate}' (Source: ${entry.user_read_at ? 'Read At' : 'Date Added'})`, 'debug');
-                            let dateStr = null;
-                            
-                            // Strategy 1: Try to capture "DD Mon YYYY" directly from standard RSS format
-                            // Example: "Sat, 20 Jan 2024..."
-                            const match = rawDate.match(/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/);
-                            if (match) {
-                                const [_, day, monthStr, year] = match;
-                                // Convert Month "Jan" -> "01"
-                                const months = {Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06', Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12'};
-                                const month = months[monthStr];
-                                if (month) {
-                                    dateStr = `${year}-${month}-${day.padStart(2, '0')}`;
-                                }
-                            }
-
-                            // Strategy 2: Fallback to JS Date if regex fails (simplified)
-                            if (!dateStr) {
-                                 const d = new Date(rawDate);
-                                 if (!isNaN(d)) {
-                                     // Use YYYY-MM-DD from the parsed date (WARNING: Timezone shift possibility if env is UTC)
-                                     dateStr = d.toISOString().split('T')[0];
-                                 }
-                            }
-
+                            const dateStr = this.parseReadDate(rawDate);
                             if (dateStr) {
                                 this.log(`Adding Read Date: ${dateStr}`, 'info');
                                 await this.addReadDate(userBookId, dateStr);
-                            } else {
-                                this.log(`Could not parse date: '${rawDate}'`, 'warn');
-                            }
-                        } else {
-                            this.log(`No date found for '${entry.title}' (read_at and date_added both empty)`, 'warn');
-                        }
+                            } else this.log(`Could not parse date: '${rawDate}'`, 'warn');
+                        } else this.log(`No date found for '${entry.title}' (read_at and date_added both empty)`, 'warn');
                     } else {
                         this.log(`❌ Failed to add: ${entry.title}`, 'error');
                         this.results.errors.push(entry.title);
@@ -295,22 +282,25 @@ export class SyncEngine {
     }
 
     async getHardcoverLibraryIds() {
-        const query = `query GetMyBooks { me { user_books(where: {status_id: {_eq: 3}}) { book { id title editions { isbn_10 isbn_13 } } } } }`;
+        // Include status_id 1 (want to read), 2 (currently-reading), 3 (read) so we can update existing rows
+        const query = `query GetMyBooks { me { user_books(where: {status_id: {_in: [1, 2, 3]}}) { id status_id book { id title editions { isbn_10 isbn_13 } } } } }`;
         const res = await this.graphqlQuery(query);
         const bookIds = new Set();
+        const bookIdToUserBook = new Map(); // book_id -> { userBookId, statusId } for updates
         const existingIsbns = new Set();
         const existingTitles = new Set();
-        
+
         const userBooks = res.data.me?.[0]?.user_books || [];
         userBooks.forEach(ub => {
             bookIds.add(ub.book.id);
+            bookIdToUserBook.set(ub.book.id, { userBookId: ub.id, statusId: ub.status_id });
             existingTitles.add(ub.book.title.trim().toLowerCase());
             if (ub.book.editions) ub.book.editions.forEach(ed => {
                 if (ed.isbn_10) existingIsbns.add(ed.isbn_10);
                 if (ed.isbn_13) existingIsbns.add(ed.isbn_13);
             });
         });
-        return { bookIds, existingIsbns, existingTitles };
+        return { bookIds, bookIdToUserBook, existingIsbns, existingTitles };
     }
 
     async searchHardcoverBookId(title, author, isbn) {
@@ -349,9 +339,32 @@ export class SyncEngine {
         return finalist.length ? finalist[0].id : null;
     }
 
+    parseReadDate(rawDate) {
+        if (!rawDate) return null;
+        const match = rawDate.match(/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/);
+        if (match) {
+            const [_, day, monthStr, year] = match;
+            const months = {Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06', Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12'};
+            const month = months[monthStr];
+            if (month) return `${year}-${month}-${day.padStart(2, '0')}`;
+        }
+        const d = new Date(rawDate);
+        return !isNaN(d) ? d.toISOString().split('T')[0] : null;
+    }
+
+    normalizeRating(rating) {
+        const n = rating ? parseInt(rating, 10) : null;
+        return (n >= 1 && n <= 5) ? n : null;
+    }
+
+    async deleteUserBook(userBookId) {
+        const mutation = `mutation DeleteUserBook($id: Int!) { delete_user_book(id: $id) { id } }`;
+        await this.graphqlQuery(mutation, { id: userBookId });
+    }
+
     async addBookToHardcover(bookId, rating, readAt) {
-        const mutation = `mutation AddUserBook($book_id: Int!, $rating: numeric) { insert_user_book(object: { book_id: $book_id, status_id: 3, rating: $rating }) { id error } }`;
-        const res = await this.graphqlQuery(mutation, { book_id: bookId, rating: rating ? parseInt(rating) : null });
+        const mutation = `mutation AddUserBook($book_id: Int!, $status_id: Int!, $rating: numeric) { insert_user_book(object: { book_id: $book_id, status_id: $status_id, rating: $rating }) { id error } }`;
+        const res = await this.graphqlQuery(mutation, { book_id: bookId, status_id: this.statusId, rating: this.normalizeRating(rating) });
         
         const data = res.data.insert_user_book;
         if (data && data.error) {
