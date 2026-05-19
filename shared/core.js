@@ -3,6 +3,31 @@
  * Used by both Chrome Extension and Node.js Script
  */
 
+// Minimal HTML entity decoder for common entities seen in RSS feeds
+const decodeHtmlEntities = (str) => {
+    if (!str || typeof str !== 'string') return str;
+    
+    const named = {
+        '&amp;': '&',
+        '&quot;': '"',
+        '&#39;': '\'',
+        '&apos;': '\'',
+        '&lt;': '<',
+        '&gt;': '>'
+    };
+
+    return str
+        .replace(/&(?:amp|quot|#39|apos|lt|gt);/g, (m) => named[m] || m)
+        .replace(/&#(\d+);/g, (_, code) => {
+            const num = parseInt(code, 10);
+            return Number.isNaN(num) ? _ : String.fromCharCode(num);
+        })
+        .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => {
+            const num = parseInt(code, 16);
+            return Number.isNaN(num) ? _ : String.fromCharCode(num);
+        });
+};
+
 export const Utils = {
     // Port of thefuzz's token_sort_ratio basic approximation or standard levenshtein
     tokenSortRatio: (str1, str2) => {
@@ -59,7 +84,9 @@ export const Utils = {
             const getTag = (tag) => {
                 const tagRegex = new RegExp(`<${tag}.*?>([\\s\\S]*?)<\/${tag}>`);
                 const match = tagRegex.exec(itemContent);
-                return match ? match[1].replace(/<!\[CDATA\[(.*?)\]\]>/g, '$1').trim() : null;
+                if (!match) return null;
+                const raw = match[1].replace(/<!\[CDATA\[(.*?)\]\]>/g, '$1').trim();
+                return decodeHtmlEntities(raw);
             };
 
             entries.push({
