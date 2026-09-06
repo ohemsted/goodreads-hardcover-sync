@@ -83,6 +83,36 @@ npm run sync -- --limit 0
 npm run sync -- --dry-run
 ```
 
+### 4. Cleaning up duplicate read entries
+
+Before the fix in `setReadDate`, every synced book ended up with **two** read
+entries: Hardcover creates one of its own when a book is added with the Read
+status, and the sync inserted a second one carrying the Goodreads date. Anything
+reading that history back — Hardcover's own stats, or your own site — reports
+those books as re-reads.
+
+New syncs no longer do this. To clear up books synced before the fix:
+
+```bash
+npm run dedupe-reads                 # report on 2026, change nothing
+npm run dedupe-reads -- --year 2025  # a different year
+npm run dedupe-reads -- --all-years  # every year at once
+npm run dedupe-reads -- --apply      # actually delete
+```
+
+It is a **dry run unless you pass `--apply`**, and it writes a JSON backup of
+every entry it removes before deleting anything.
+
+Reads are only ever compared **within a single year**, so a book you genuinely
+read again in a later year keeps both of its entries. By default the entry with
+the earliest finish date in a year is kept — that is the one carrying your real
+Goodreads date, since the spurious entry is dated whenever the sync ran. Use
+`--keep latest` to flip that.
+
+One thing to watch: a book you genuinely read twice *in the same year* looks
+identical to a duplicate, and would be collapsed to one entry. The dry run lists
+every book it intends to touch, so check that list before passing `--apply`.
+
 ## GitHub Actions Setup (Free)
 
 This script is optimized to run **daily** on GitHub Actions for free (negligible usage per year vs 2000 free minutes).

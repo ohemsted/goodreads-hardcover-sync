@@ -201,7 +201,7 @@ export class SyncEngine {
                                     const dateStr = this.parseReadDate(rawDate);
                                     if (dateStr) {
                                         this.log(`Adding Read Date: ${dateStr}`, 'info');
-                                        await this.addReadDate(userBookId, dateStr);
+                                        await this.setReadDate(userBookId, dateStr);
                                     }
                                 }
                             }
@@ -241,7 +241,7 @@ export class SyncEngine {
                             const dateStr = this.parseReadDate(rawDate);
                             if (dateStr) {
                                 this.log(`Adding Read Date: ${dateStr}`, 'info');
-                                await this.addReadDate(userBookId, dateStr);
+                                await this.setReadDate(userBookId, dateStr);
                             } else this.log(`Could not parse date: '${rawDate}'`, 'warn');
                         } else this.log(`No date found for '${entry.title}' (read_at and date_added both empty)`, 'warn');
                     } else {
@@ -406,8 +406,33 @@ export class SyncEngine {
         return data?.id;
     }
 
-    async addReadDate(userBookId, finishedAt) {
-        const mutation = `mutation AddReadDate($user_book_id: Int!, $finished_at: date) { insert_user_book_read(user_book_id: $user_book_id, user_book_read: {finished_at: $finished_at}) { id } }`;
-        await this.graphqlQuery(mutation, { user_book_id: userBookId, finished_at: finishedAt });
+    async getReads(userBookId) {
+        const query = `query ExistingReads($user_book_id: Int!) { user_book_reads(where: {user_book_id: {_eq: $user_book_id}}, order_by: {id: asc}) { id started_at finished_at } }`;
+        const res = await this.graphqlQuery(query, { user_book_id: userBookId });
+        return res?.data?.user_book_reads || [];
+    }
+
+    /**
+     * Records the finish date for a book.
+     *
+     * Hardcover creates a read entry of its own when a user_book is inserted
+     * with the Read status, so inserting a second one here left every synced
+     * book with two reads — which anything reading the history back reports as
+     * a re-read. Fill in the entry Hardcover already made, and only insert when
+     * there genuinely isn't one.
+     */
+    async setReadDate(userBookId, finishedAt) {
+        const existing = await this.getReads(userBookId);
+
+        if (existing.length === 0) {
+            const mutation = `mutation AddReadDate($user_book_id: Int!, $finished_at: date) { insert_user_book_read(user_book_id: $user_book_id, user_book_read: {finished_at: $finished_at}) { id } }`;
+            await this.graphqlQuery(mutation, { user_book_id: userBookId, finished_at: finishedAt });
+            return;
+        }
+
+        // The oldest entry is the one created alongside the user_book. Updating
+        // it keeps whatever started_at Hardcover recorded with it.
+        const mutation = `mutation SetReadDate($id: Int!, $finished_at: date) { update_user_book_read(id: $id, object: {finished_at: $finished_at}) { id } }`;
+        await this.graphqlQuery(mutation, { id: existing[0].id, finished_at: finishedAt });
     }
 }
