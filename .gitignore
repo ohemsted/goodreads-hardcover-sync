@@ -8,3 +8,4 @@ introspect_api.py
 debug_*.py
 verify_*.py
 node_modules/
+dedupe-reads-backup-*.json
