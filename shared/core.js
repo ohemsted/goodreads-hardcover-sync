@@ -235,7 +235,7 @@ export class SyncEngine {
 
                 // REAL RUN
                 try {
-                    const added = await this.addFirstAvailableBook(candidateIds, entry.user_rating, entry.user_read_at);
+                    const added = await this.addFirstAvailableBook(candidateIds, entry);
                     const userBookId = added.userBookId;
                     if (userBookId) {
                         bookId = added.bookId;
@@ -383,19 +383,59 @@ export class SyncEngine {
         for (const isbn of [entry.isbn13, entry.isbn]) {
             if (isbn && existingIsbns.has(isbn)) return existingIsbns.get(isbn);
         }
-        return existingTitles.get(entry.title.trim().toLowerCase()) ?? null;
+        // Goodreads titles often carry a subtitle Hardcover's don't, so also try the short title
+        const title = entry.title.trim();
+        const titles = [title, ...[':', '('].filter(sep => title.includes(sep))
+            .map(sep => title.split(sep)[0].trim()).filter(t => t.length >= 4)];
+        for (const t of titles) {
+            const id = existingTitles.get(t.toLowerCase());
+            if (id) return id;
+        }
+        return null;
     }
 
     // Inserts the first candidate Hardcover accepts. Moves past records Hardcover reports
     // as missing ("Was it deleted?"); any other failure stops the attempt.
-    async addFirstAvailableBook(candidateIds, rating, readAt) {
-        for (const bookId of candidateIds) {
-            const { userBookId, missing } = await this.addBookToHardcover(bookId, rating, readAt);
-            if (userBookId) return { bookId, userBookId };
-            if (!missing) break;
-            this.log(`Book ID ${bookId} is missing on Hardcover, trying next match...`, 'warn');
+    // If every candidate is missing, retries with Hardcover's full-text search, which finds
+    // the live record when its title differs from the dead one's.
+    async addFirstAvailableBook(candidateIds, entry) {
+        const tried = new Set();
+        const tryAll = async (ids) => {
+            for (const bookId of ids) {
+                if (tried.has(bookId)) continue;
+                tried.add(bookId);
+                const { userBookId, missing } = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
+                if (userBookId) return { bookId, userBookId, allMissing: false };
+                if (!missing) return { bookId: null, userBookId: null, allMissing: false };
+                this.log(`Book ID ${bookId} is missing on Hardcover, trying next match...`, 'warn');
+            }
+            return { bookId: null, userBookId: null, allMissing: true };
+        };
+
+        const result = await tryAll(candidateIds);
+        if (!result.allMissing) return result;
+
+        let fallbackIds = [];
+        try {
+            fallbackIds = await this.fullTextSearchBookIds(entry.title, entry.author_name);
+        } catch (e) {
+            this.log(`Full-text search failed for ${entry.title}: ${e.message}`, 'error');
         }
-        return { bookId: null, userBookId: null };
+        this.log(`[Fallback] Full-text search found ${fallbackIds.length} match(es) for '${entry.title}'`, 'info');
+        return tryAll(fallbackIds);
+    }
+
+    async fullTextSearchBookIds(title, author) {
+        const query = `query FullTextSearch($query: String!) { search(query: $query, query_type: "Book", per_page: 10) { results } }`;
+        const short = title.split(':')[0].trim();
+        const res = await this.graphqlQuery(query, { query: `${short} ${author || ''}`.trim() });
+        let results = res.data.search?.results;
+        if (typeof results === 'string') results = JSON.parse(results);
+        return (results?.hits || [])
+            .map(h => h.document || {})
+            .filter(d => (d.author_names || []).some(a => Utils.tokenSortRatio(author, a) > 70))
+            .map(d => parseInt(d.id, 10))
+            .filter(id => !Number.isNaN(id));
     }
 
     parseReadDate(rawDate) {
