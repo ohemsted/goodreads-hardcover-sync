@@ -161,13 +161,20 @@ export class SyncEngine {
                 // --- A. API Verification ---
                 this.log(`[Candidate] '${entry.title}' - Verifying...`, 'info');
                 
-                let bookId = null;
-                try {
-                    bookId = await this.searchHardcoverBookId(entry.title, entry.author_name, entry.isbn13 || entry.isbn);
-                } catch (e) {
-                    this.log(`Search failed for ${entry.title}: ${e.message}`, 'error');
+                let candidateIds = [];
+                const libraryBookId = this.findLibraryBookId(entry, existingIsbns, existingTitles);
+                if (libraryBookId) {
+                    this.log(`[Library Match] '${entry.title}' already in library (ID: ${libraryBookId})`, 'debug');
+                    candidateIds = [libraryBookId];
+                } else {
+                    try {
+                        candidateIds = await this.searchHardcoverBookIds(entry.title, entry.author_name, entry.isbn13 || entry.isbn);
+                    } catch (e) {
+                        this.log(`Search failed for ${entry.title}: ${e.message}`, 'error');
+                    }
                 }
 
+                let bookId = candidateIds[0] ?? null;
                 if (!bookId) {
                     this.log(`[No Match] Could not find '${entry.title}' in Hardcover.`, 'warn');
                     // We DO NOT count unmatchable books as newBooks, same as extension fix
@@ -189,7 +196,7 @@ export class SyncEngine {
                     }
                     try {
                         await this.deleteUserBook(existing.userBookId);
-                        const userBookId = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
+                        const { userBookId } = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
                         if (userBookId) {
                             bookIdToUserBook.set(bookId, { userBookId, statusId: this.statusId });
                             this.results.newBooks++;
@@ -228,8 +235,10 @@ export class SyncEngine {
 
                 // REAL RUN
                 try {
-                    const userBookId = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
+                    const added = await this.addFirstAvailableBook(candidateIds, entry.user_rating, entry.user_read_at);
+                    const userBookId = added.userBookId;
                     if (userBookId) {
+                        bookId = added.bookId;
                         bookIds.add(bookId);
                         this.results.newBooks++;
                         this.results.added.push({ title: entry.title, id: bookId });
@@ -314,23 +323,23 @@ export class SyncEngine {
         const res = await this.graphqlQuery(query);
         const bookIds = new Set();
         const bookIdToUserBook = new Map(); // book_id -> { userBookId, statusId } for updates
-        const existingIsbns = new Set();
-        const existingTitles = new Set();
+        const existingIsbns = new Map(); // isbn -> book_id
+        const existingTitles = new Map(); // lowercased title -> book_id
 
         const userBooks = res.data.me?.[0]?.user_books || [];
         userBooks.forEach(ub => {
             bookIds.add(ub.book.id);
             bookIdToUserBook.set(ub.book.id, { userBookId: ub.id, statusId: ub.status_id });
-            existingTitles.add(ub.book.title.trim().toLowerCase());
+            existingTitles.set(ub.book.title.trim().toLowerCase(), ub.book.id);
             if (ub.book.editions) ub.book.editions.forEach(ed => {
-                if (ed.isbn_10) existingIsbns.add(ed.isbn_10);
-                if (ed.isbn_13) existingIsbns.add(ed.isbn_13);
+                if (ed.isbn_10) existingIsbns.set(ed.isbn_10, ub.book.id);
+                if (ed.isbn_13) existingIsbns.set(ed.isbn_13, ub.book.id);
             });
         });
         return { bookIds, bookIdToUserBook, existingIsbns, existingTitles };
     }
 
-    async searchHardcoverBookId(title, author, isbn) {
+    async searchHardcoverBookIds(title, author, isbn) {
         const candidates = {};
         
         const searchAndVerify = async (searchTitle, sourceLabel) => {
@@ -362,8 +371,31 @@ export class SyncEngine {
             }
         }
 
-        const finalist = Object.values(candidates).sort((a, b) => (b.users_count || 0) - (a.users_count || 0));
-        return finalist.length ? finalist[0].id : null;
+        // Ranked best-first, so callers can fall back when Hardcover rejects the top match
+        return Object.values(candidates)
+            .sort((a, b) => (b.users_count || 0) - (a.users_count || 0))
+            .map(c => c.id);
+    }
+
+    // Book already in the library under a different ID (e.g. the search's top match is a
+    // dead duplicate but the user added the live record by hand)?
+    findLibraryBookId(entry, existingIsbns, existingTitles) {
+        for (const isbn of [entry.isbn13, entry.isbn]) {
+            if (isbn && existingIsbns.has(isbn)) return existingIsbns.get(isbn);
+        }
+        return existingTitles.get(entry.title.trim().toLowerCase()) ?? null;
+    }
+
+    // Inserts the first candidate Hardcover accepts. Moves past records Hardcover reports
+    // as missing ("Was it deleted?"); any other failure stops the attempt.
+    async addFirstAvailableBook(candidateIds, rating, readAt) {
+        for (const bookId of candidateIds) {
+            const { userBookId, missing } = await this.addBookToHardcover(bookId, rating, readAt);
+            if (userBookId) return { bookId, userBookId };
+            if (!missing) break;
+            this.log(`Book ID ${bookId} is missing on Hardcover, trying next match...`, 'warn');
+        }
+        return { bookId: null, userBookId: null };
     }
 
     parseReadDate(rawDate) {
@@ -400,10 +432,10 @@ export class SyncEngine {
              } else {
                  this.log(`[API Error] Failed to add book ${bookId}: ${data.error}`, 'error');
              }
-             return null;
+             return { userBookId: null, missing: /weren't able to find that book/i.test(data.error) };
         }
         
-        return data?.id;
+        return { userBookId: data?.id, missing: false };
     }
 
     async getReads(userBookId) {

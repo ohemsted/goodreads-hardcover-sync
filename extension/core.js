@@ -163,12 +163,14 @@ export class SyncEngine {
                 // --- B. API Verification ---
                 this.log(`[Candidate] '${entry.title}' - Verifying...`, 'info');
                 
-                let bookId = null;
+                let candidateIds = [];
                 try {
-                    bookId = await this.searchHardcoverBookId(entry.title, entry.author_name, entry.isbn13 || entry.isbn);
+                    candidateIds = await this.searchHardcoverBookIds(entry.title, entry.author_name, entry.isbn13 || entry.isbn);
                 } catch (e) {
                     this.log(`Search failed for ${entry.title}: ${e.message}`, 'error');
                 }
+
+                let bookId = candidateIds[0] ?? null;
 
                 if (!bookId) {
                     this.log(`[No Match] Could not find '${entry.title}' in Hardcover.`, 'warn');
@@ -193,8 +195,10 @@ export class SyncEngine {
 
                 // REAL RUN
                 try {
-                    const userBookId = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
+                    const added = await this.addFirstAvailableBook(candidateIds, entry.user_rating, entry.user_read_at);
+                    const userBookId = added.userBookId;
                     if (userBookId) {
+                        bookId = added.bookId;
                         bookIds.add(bookId);
                         this.results.newBooks++;
                         this.results.added.push({ title: entry.title, id: bookId });
@@ -322,7 +326,7 @@ export class SyncEngine {
         return { bookIds, existingIsbns, existingTitles };
     }
 
-    async searchHardcoverBookId(title, author, isbn) {
+    async searchHardcoverBookIds(title, author, isbn) {
         const candidates = {};
         
         const searchAndVerify = async (searchTitle, sourceLabel) => {
@@ -354,8 +358,22 @@ export class SyncEngine {
             }
         }
 
-        const finalist = Object.values(candidates).sort((a, b) => (b.users_count || 0) - (a.users_count || 0));
-        return finalist.length ? finalist[0].id : null;
+        // Ranked best-first, so callers can fall back when Hardcover rejects the top match
+        return Object.values(candidates)
+            .sort((a, b) => (b.users_count || 0) - (a.users_count || 0))
+            .map(c => c.id);
+    }
+
+    // Inserts the first candidate Hardcover accepts. Moves past records Hardcover reports
+    // as missing ("Was it deleted?"); any other failure stops the attempt.
+    async addFirstAvailableBook(candidateIds, rating, readAt) {
+        for (const bookId of candidateIds) {
+            const { userBookId, missing } = await this.addBookToHardcover(bookId, rating, readAt);
+            if (userBookId) return { bookId, userBookId };
+            if (!missing) break;
+            this.log(`Book ID ${bookId} is missing on Hardcover, trying next match...`, 'warn');
+        }
+        return { bookId: null, userBookId: null };
     }
 
     async addBookToHardcover(bookId, rating, readAt) {
@@ -369,10 +387,10 @@ export class SyncEngine {
              } else {
                  this.log(`[API Error] Failed to add book ${bookId}: ${data.error}`, 'error');
              }
-             return null;
+             return { userBookId: null, missing: /weren't able to find that book/i.test(data.error) };
         }
         
-        return data?.id;
+        return { userBookId: data?.id, missing: false };
     }
 
     async getReads(userBookId) {
