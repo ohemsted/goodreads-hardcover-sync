@@ -115,7 +115,10 @@ export class SyncEngine {
         this.hcEndpoint = "https://api.hardcover.app/v1/graphql";
         this.results = {
             newBooks: 0,
-            added: [],
+            added: [],      // { title, id } newly added with this feed's status
+            updated: [],    // { title, id, fromStatus, toStatus } moved from another status
+            upToDate: 0,    // already in the library with this feed's status
+            unmatched: [],  // titles not found on Hardcover
             errors: []
         };
     }
@@ -177,6 +180,7 @@ export class SyncEngine {
                 let bookId = candidateIds[0] ?? null;
                 if (!bookId) {
                     this.log(`[No Match] Could not find '${entry.title}' in Hardcover.`, 'warn');
+                    this.results.unmatched.push(entry.title);
                     // We DO NOT count unmatchable books as newBooks, same as extension fix
                     continue;
                 }
@@ -295,12 +299,13 @@ export class SyncEngine {
         const existing = bookIdToUserBook.get(bookId);
         if (existing.statusId === this.statusId) {
             this.log(`[Skip] '${entry.title}' (already status ${this.statusId})`, 'debug');
+            this.results.upToDate++;
             return;
         }
         this.log(`[Update] '${entry.title}' (ID: ${bookId}) - status ${existing.statusId} -> ${this.statusId}`, 'info');
+        const change = { title: entry.title, id: bookId, fromStatus: existing.statusId, toStatus: this.statusId };
         if (this.isDryRun) {
-            this.results.newBooks++;
-            this.results.added.push({ title: entry.title, id: bookId });
+            this.results.updated.push(change);
             return;
         }
         try {
@@ -310,8 +315,7 @@ export class SyncEngine {
             const { userBookId } = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
             if (userBookId) {
                 bookIdToUserBook.set(bookId, { userBookId, statusId: this.statusId });
-                this.results.newBooks++;
-                this.results.added.push({ title: entry.title, id: bookId });
+                this.results.updated.push(change);
                 this.log(`✅ Updated: ${entry.title}`, 'success');
                 if (this.statusId === 3) {
                     const rawDate = entry.user_read_at || entry.user_date_added;

@@ -7,6 +7,8 @@ dotenv.config();
 /**
  * Main Entry Point for Node.js
  */
+const STATUS_NAMES = { 1: 'Want to Read', 2: 'Currently Reading', 3: 'Read' };
+
 async function main() {
     console.log("=== Kindle Sync (Node.js) ===");
     
@@ -25,12 +27,9 @@ async function main() {
     const limitArgIndex = process.argv.indexOf('--limit');
     const LIMIT = limitArgIndex > -1 ? parseInt(process.argv[limitArgIndex + 1]) : 20;
 
-    // Combined results from all syncs
-    const combinedResults = {
-        newBooks: 0,
-        added: [],
-        errors: []
-    };
+    // Results per feed, for the summary
+    const feeds = [];
+    const combinedResults = { errors: [] };
 
     // 2. Sync Read Feed (status_id: 3)
     console.log("\n--- Syncing Read Books (status_id: 3) ---");
@@ -49,8 +48,7 @@ async function main() {
 
     try {
         const readResults = await readEngine.run();
-        combinedResults.newBooks += readResults.newBooks;
-        combinedResults.added.push(...readResults.added);
+        feeds.push({ statusId: 3, ...readResults });
         combinedResults.errors.push(...readResults.errors);
     } catch (e) {
         console.error("Critical Error syncing read feed:", e);
@@ -75,8 +73,7 @@ async function main() {
 
         try {
             const currentlyReadingResults = await currentlyReadingEngine.run();
-            combinedResults.newBooks += currentlyReadingResults.newBooks;
-            combinedResults.added.push(...currentlyReadingResults.added);
+            feeds.push({ statusId: 2, ...currentlyReadingResults });
             combinedResults.errors.push(...currentlyReadingResults.errors);
         } catch (e) {
             console.error("Critical Error syncing currently-reading feed:", e);
@@ -88,9 +85,15 @@ async function main() {
 
     // 4. Summary
     console.log("\n=== Sync Summary ===");
-    console.log(`New Books Added: ${combinedResults.newBooks}`);
-    if(combinedResults.added.length > 0) {
-        combinedResults.added.forEach(b => console.log(` - ${b.title} (ID: ${b.id})`));
+    if (DRY_RUN) console.log("DRY RUN: nothing was changed on Hardcover. Below is what would have happened.");
+    for (const f of feeds) {
+        const name = STATUS_NAMES[f.statusId];
+        console.log(`\n${name} feed: ${f.added.length} added, ${f.updated.length} moved to ${name}, ${f.upToDate} already up to date` +
+            (f.unmatched.length ? `, ${f.unmatched.length} not found on Hardcover` : '') +
+            (f.errors.length ? `, ${f.errors.length} failed` : ''));
+        f.added.forEach(b => console.log(` + Added as ${name}: ${b.title} (Hardcover ID: ${b.id})`));
+        f.updated.forEach(b => console.log(` ~ Moved ${STATUS_NAMES[b.fromStatus] || `status ${b.fromStatus}`} -> ${name}: ${b.title} (Hardcover ID: ${b.id})`));
+        f.unmatched.forEach(t => console.log(` ? Not found on Hardcover: ${t}`));
     }
     if(combinedResults.errors.length > 0) {
          console.log("\nErrors encountered:");
