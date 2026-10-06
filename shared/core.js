@@ -182,45 +182,9 @@ export class SyncEngine {
                 }
 
                 // --- C. Existing Book? Update instead of insert ---
-                const existing = bookIdToUserBook.get(bookId);
-                if (existing) {
-                    if (existing.statusId === this.statusId) {
-                        this.log(`[Skip] '${entry.title}' (already status ${this.statusId})`, 'debug');
-                        continue;
-                    }
-                    this.log(`[Update] '${entry.title}' (ID: ${bookId}) - status ${existing.statusId} -> ${this.statusId}`, 'info');
-                    if (this.isDryRun) {
-                        this.results.newBooks++;
-                        this.results.added.push({ title: entry.title, id: bookId });
-                        continue;
-                    }
-                    try {
-                        await this.deleteUserBook(existing.userBookId);
-                        const { userBookId } = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
-                        if (userBookId) {
-                            bookIdToUserBook.set(bookId, { userBookId, statusId: this.statusId });
-                            this.results.newBooks++;
-                            this.results.added.push({ title: entry.title, id: bookId });
-                            this.log(`✅ Updated: ${entry.title}`, 'success');
-                            if (this.statusId === 3) {
-                                const rawDate = entry.user_read_at || entry.user_date_added;
-                                if (rawDate) {
-                                    const dateStr = this.parseReadDate(rawDate);
-                                    if (dateStr) {
-                                        this.log(`Adding Read Date: ${dateStr}`, 'info');
-                                        await this.setReadDate(userBookId, dateStr);
-                                    }
-                                }
-                            }
-                        } else {
-                            this.log(`❌ Failed to re-add: ${entry.title}`, 'error');
-                            this.results.errors.push(entry.title);
-                        }
-                    } catch (e) {
-                        this.log(`❌ Error updating '${entry.title}': ${e.message}`, 'error');
-                        this.results.errors.push(`${entry.title} (${e.message})`);
-                    }
-                    await new Promise(r => setTimeout(r, 2000));
+                const libraryCandidate = candidateIds.find(id => bookIdToUserBook.has(id));
+                if (libraryCandidate) {
+                    await this.updateExistingStatus(entry, libraryCandidate, bookIdToUserBook);
                     continue;
                 }
 
@@ -235,7 +199,11 @@ export class SyncEngine {
 
                 // REAL RUN
                 try {
-                    const added = await this.addFirstAvailableBook(candidateIds, entry);
+                    const added = await this.addFirstAvailableBook(candidateIds, entry, bookIdToUserBook);
+                    if (added.inLibrary) {
+                        await this.updateExistingStatus(entry, added.bookId, bookIdToUserBook);
+                        continue;
+                    }
                     const userBookId = added.userBookId;
                     if (userBookId) {
                         bookId = added.bookId;
@@ -244,8 +212,12 @@ export class SyncEngine {
                         this.results.added.push({ title: entry.title, id: bookId });
                         this.log(`✅ Added: ${entry.title}`, 'success');
 
+                        // A finish date is what makes Hardcover treat a book as read, so
+                        // only finished books get one.
                         const rawDate = entry.user_read_at || entry.user_date_added;
-                        if (rawDate) {
+                        if (this.statusId !== 3) {
+                            this.log(`Status ${this.statusId}: not setting a read date`, 'debug');
+                        } else if (rawDate) {
                             this.log(`Received Date: '${rawDate}' (Source: ${entry.user_read_at ? 'Read At' : 'Date Added'})`, 'debug');
                             const dateStr = this.parseReadDate(rawDate);
                             if (dateStr) {
@@ -317,20 +289,70 @@ export class SyncEngine {
         }
     }
 
+    // Brings a book already in the library to this feed's status. The status change is
+    // done by deleting and re-adding the user_book, which also drops its read entries.
+    async updateExistingStatus(entry, bookId, bookIdToUserBook) {
+        const existing = bookIdToUserBook.get(bookId);
+        if (existing.statusId === this.statusId) {
+            this.log(`[Skip] '${entry.title}' (already status ${this.statusId})`, 'debug');
+            return;
+        }
+        this.log(`[Update] '${entry.title}' (ID: ${bookId}) - status ${existing.statusId} -> ${this.statusId}`, 'info');
+        if (this.isDryRun) {
+            this.results.newBooks++;
+            this.results.added.push({ title: entry.title, id: bookId });
+            return;
+        }
+        try {
+            const oldReads = await this.getReads(existing.userBookId);
+            if (oldReads.length) this.log(`Removing ${oldReads.length} read entr${oldReads.length === 1 ? 'y' : 'ies'} with the old status: ${JSON.stringify(oldReads)}`, 'info');
+            await this.deleteUserBook(existing.userBookId);
+            const { userBookId } = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
+            if (userBookId) {
+                bookIdToUserBook.set(bookId, { userBookId, statusId: this.statusId });
+                this.results.newBooks++;
+                this.results.added.push({ title: entry.title, id: bookId });
+                this.log(`✅ Updated: ${entry.title}`, 'success');
+                if (this.statusId === 3) {
+                    const rawDate = entry.user_read_at || entry.user_date_added;
+                    if (rawDate) {
+                        const dateStr = this.parseReadDate(rawDate);
+                        if (dateStr) {
+                            this.log(`Adding Read Date: ${dateStr}`, 'info');
+                            await this.setReadDate(userBookId, dateStr);
+                        }
+                    }
+                }
+                this.log(`Read entries now: ${JSON.stringify(await this.getReads(userBookId))}`, 'info');
+            } else {
+                this.log(`❌ Failed to re-add: ${entry.title}`, 'error');
+                this.results.errors.push(entry.title);
+            }
+        } catch (e) {
+            this.log(`❌ Error updating '${entry.title}': ${e.message}`, 'error');
+            this.results.errors.push(`${entry.title} (${e.message})`);
+        }
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
     async getHardcoverLibraryIds() {
         // Include status_id 1 (want to read), 2 (currently-reading), 3 (read) so we can update existing rows
-        const query = `query GetMyBooks { me { user_books(where: {status_id: {_in: [1, 2, 3]}}) { id status_id book { id title editions { isbn_10 isbn_13 } } } } }`;
+        const query = `query GetMyBooks { me { user_books(where: {status_id: {_in: [1, 2, 3]}}) { id status_id book { id title contributions { author { name } } editions { isbn_10 isbn_13 } } } } }`;
         const res = await this.graphqlQuery(query);
         const bookIds = new Set();
         const bookIdToUserBook = new Map(); // book_id -> { userBookId, statusId } for updates
         const existingIsbns = new Map(); // isbn -> book_id
-        const existingTitles = new Map(); // lowercased title -> book_id
+        const existingTitles = new Map(); // lowercased title (and short title) -> [{ bookId, authors, exact }]
 
         const userBooks = res.data.me?.[0]?.user_books || [];
         userBooks.forEach(ub => {
             bookIds.add(ub.book.id);
             bookIdToUserBook.set(ub.book.id, { userBookId: ub.id, statusId: ub.status_id });
-            existingTitles.set(ub.book.title.trim().toLowerCase(), ub.book.id);
+            const authors = (ub.book.contributions || []).map(c => c.author?.name).filter(n => n);
+            this.titleVariants(ub.book.title).forEach((t, i) => {
+                if (!existingTitles.has(t)) existingTitles.set(t, []);
+                existingTitles.get(t).push({ bookId: ub.book.id, authors, exact: i === 0 });
+            });
             if (ub.book.editions) ub.book.editions.forEach(ed => {
                 if (ed.isbn_10) existingIsbns.set(ed.isbn_10, ub.book.id);
                 if (ed.isbn_13) existingIsbns.set(ed.isbn_13, ub.book.id);
@@ -383,27 +405,39 @@ export class SyncEngine {
         for (const isbn of [entry.isbn13, entry.isbn]) {
             if (isbn && existingIsbns.has(isbn)) return existingIsbns.get(isbn);
         }
-        // Goodreads titles often carry a subtitle Hardcover's don't, so also try the short title
-        const title = entry.title.trim();
-        const titles = [title, ...[':', '('].filter(sep => title.includes(sep))
-            .map(sep => title.split(sep)[0].trim()).filter(t => t.length >= 4)];
-        for (const t of titles) {
-            const id = existingTitles.get(t.toLowerCase());
-            if (id) return id;
+        // An exact full-title match is trusted as before. A match that relies on a short
+        // title on either side ("Dune" vs "Dune: Messiah") also needs the author to agree.
+        const variants = this.titleVariants(entry.title);
+        const exact = (existingTitles.get(variants[0]) || []).find(m => m.exact);
+        if (exact) return exact.bookId;
+        for (const t of variants) {
+            const match = (existingTitles.get(t) || [])
+                .find(m => m.authors.some(a => Utils.tokenSortRatio(entry.author_name || '', a) > 70));
+            if (match) return match.bookId;
         }
         return null;
+    }
+
+    // Lowercased full title plus the part before ':' or '('. Goodreads and Hardcover often
+    // disagree on subtitles, so both the library and the feed are matched on these.
+    titleVariants(rawTitle) {
+        const title = rawTitle.trim().toLowerCase();
+        const shorts = [':', '('].filter(sep => title.includes(sep))
+            .map(sep => title.split(sep)[0].trim()).filter(t => t.length >= 4);
+        return [title, ...shorts];
     }
 
     // Inserts the first candidate Hardcover accepts. Moves past records Hardcover reports
     // as missing ("Was it deleted?"); any other failure stops the attempt.
     // If every candidate is missing, retries with Hardcover's full-text search, which finds
     // the live record when its title differs from the dead one's.
-    async addFirstAvailableBook(candidateIds, entry) {
+    async addFirstAvailableBook(candidateIds, entry, bookIdToUserBook = new Map()) {
         const tried = new Set();
         const tryAll = async (ids) => {
             for (const bookId of ids) {
                 if (tried.has(bookId)) continue;
                 tried.add(bookId);
+                if (bookIdToUserBook.has(bookId)) return { bookId, userBookId: null, allMissing: false, inLibrary: true };
                 const { userBookId, missing } = await this.addBookToHardcover(bookId, entry.user_rating, entry.user_read_at);
                 if (userBookId) return { bookId, userBookId, allMissing: false };
                 if (!missing) return { bookId: null, userBookId: null, allMissing: false };
