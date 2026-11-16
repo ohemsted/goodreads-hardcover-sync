@@ -142,9 +142,18 @@ export class SyncEngine {
             const res = await fetch(this.rssUrl);
             const text = await res.text();
             const entries = Utils.parseRSS(text);
-            
+
             if (entries.length === 0) {
-                this.log("No entries found in RSS.", "warn");
+                // An empty-but-valid feed (e.g. nothing currently being read) is fine.
+                // Anything else (HTTP error, login/captcha page, bot block) means Goodreads
+                // didn't give us the feed, and must not look like a successful sync.
+                // The URL is deliberately not logged: it contains the feed key.
+                const looksLikeFeed = /<rss[\s>]|<channel[\s>]/.test(text);
+                if (!res.ok || !looksLikeFeed) {
+                    const snippet = text.replace(/\s+/g, ' ').slice(0, 300);
+                    throw new Error(`Goodreads did not return a usable RSS feed (HTTP ${res.status}, content-type: ${res.headers.get('content-type')}, ${text.length} bytes). Body starts: ${snippet}`);
+                }
+                this.log("RSS feed is valid but contains no entries.", "warn");
                 return this.results;
             }
 
